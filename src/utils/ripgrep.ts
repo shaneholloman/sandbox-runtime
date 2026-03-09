@@ -1,10 +1,12 @@
-import { execFile } from 'child_process'
-import type { ExecFileException } from 'child_process'
+import { spawn } from 'child_process'
+import { text } from 'node:stream/consumers'
 import { whichSync } from './which.js'
 
 export interface RipgrepConfig {
   command: string
   args?: string[]
+  /** Override argv[0] when spawning (for multicall binaries that dispatch on argv[0]) */
+  argv0?: string
 }
 
 /**
@@ -30,37 +32,30 @@ export async function ripGrep(
   abortSignal: AbortSignal,
   config: RipgrepConfig = { command: 'rg' },
 ): Promise<string[]> {
-  const { command, args: commandArgs = [] } = config
+  const { command, args: commandArgs = [], argv0 } = config
 
-  return new Promise((resolve, reject) => {
-    execFile(
-      command,
-      [...commandArgs, ...args, target],
-      {
-        maxBuffer: 20_000_000, // 20MB
-        signal: abortSignal,
-        timeout: 10_000, // 10 second timeout
-      },
-      (error: ExecFileException | null, stdout: string, stderr: string) => {
-        // Success case - exit code 0
-        if (!error) {
-          resolve(stdout.trim().split('\n').filter(Boolean))
-          return
-        }
-
-        // Exit code 1 means "no matches found" - this is normal, return empty array
-        if (error.code === 1) {
-          resolve([])
-          return
-        }
-
-        // All other errors should fail
-        reject(
-          new Error(
-            `ripgrep failed with exit code ${error.code}: ${stderr || error.message}`,
-          ),
-        )
-      },
-    )
+  const child = spawn(command, [...commandArgs, ...args, target], {
+    argv0,
+    signal: abortSignal,
+    timeout: 10_000,
+    windowsHide: true,
   })
+
+  const [stdout, stderr, code] = await Promise.all([
+    text(child.stdout),
+    text(child.stderr),
+    new Promise<number | null>((resolve, reject) => {
+      child.on('close', resolve)
+      child.on('error', reject)
+    }),
+  ])
+
+  if (code === 0) {
+    return stdout.trim().split('\n').filter(Boolean)
+  }
+  if (code === 1) {
+    // Exit code 1 means "no matches found" - this is normal
+    return []
+  }
+  throw new Error(`ripgrep failed with exit code ${code}: ${stderr}`)
 }
