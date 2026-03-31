@@ -755,4 +755,114 @@ describe('allowWrite glob suffix handling', () => {
       rmSync(parentDir, { recursive: true, force: true })
     }
   })
+
+  // Regression: #190 reordered denyWrite after denyRead so .git/hooks ro-binds
+  // survive a tmpfs over an ancestor. But denyWrite's --ro-bind <host> <host>
+  // now lands after denyRead's --ro-bind /dev/null <host>, undoing the mask
+  // when the same file is in both lists.
+  it('does not let denyWrite unmask a denyRead /dev/null bind (Linux)', async () => {
+    if (getPlatform() !== 'linux') {
+      return
+    }
+
+    const parentDir = join(tmpdir(), `srt-test-unmask-${Date.now()}`)
+    const secret = join(parentDir, 'secret.txt')
+    mkdirSync(parentDir, { recursive: true })
+    writeFileSync(secret, '')
+
+    try {
+      await SandboxManager.reset()
+      await SandboxManager.initialize({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: {
+          denyRead: [secret],
+          allowWrite: [parentDir],
+          denyWrite: [secret],
+        },
+      })
+
+      const result = await SandboxManager.wrapWithSandbox(command)
+
+      // The /dev/null mask is what we want; the host-file bind is what we don't.
+      expect(result).toContain(`--ro-bind /dev/null ${secret}`)
+      expect(result).not.toContain(`--ro-bind ${secret} ${secret}`)
+    } finally {
+      await SandboxManager.reset()
+      rmSync(parentDir, { recursive: true, force: true })
+    }
+  })
+
+  // A file listed in denyRead should stay denied even if allowRead covers its
+  // parent directory. Before this change, startsWith(allowPath + '/') matched
+  // and the file-deny was silently skipped.
+  it('file-level denyRead survives a parent-directory allowRead (Linux)', async () => {
+    if (getPlatform() !== 'linux') {
+      return
+    }
+
+    const parentDir = join(tmpdir(), `srt-test-file-deny-${Date.now()}`)
+    const secret = join(parentDir, '.env')
+    mkdirSync(parentDir, { recursive: true })
+    writeFileSync(secret, '')
+
+    try {
+      await SandboxManager.reset()
+      await SandboxManager.initialize({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: {
+          denyRead: [secret],
+          allowRead: [parentDir],
+          allowWrite: [parentDir],
+          denyWrite: [],
+        },
+      })
+
+      const result = await SandboxManager.wrapWithSandbox(command)
+
+      expect(result).toContain(`--ro-bind /dev/null ${secret}`)
+    } finally {
+      await SandboxManager.reset()
+      rmSync(parentDir, { recursive: true, force: true })
+    }
+  })
+
+  // denyRead entries are sorted shallow-first before mounting, so a file-deny
+  // listed before its ancestor dir-deny still lands on top of the ancestor's
+  // tmpfs + re-allow binds.
+  it('file-deny survives ancestor dir-deny listed after it in denyRead (Linux)', async () => {
+    if (getPlatform() !== 'linux') {
+      return
+    }
+
+    const parentDir = join(tmpdir(), `srt-test-order-${Date.now()}`)
+    const projectDir = join(parentDir, 'project')
+    const envFile = join(projectDir, '.env')
+    mkdirSync(projectDir, { recursive: true })
+    writeFileSync(envFile, '')
+
+    try {
+      await SandboxManager.reset()
+      await SandboxManager.initialize({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: {
+          // File deliberately listed before the dir that contains it
+          denyRead: [envFile, parentDir],
+          allowRead: [projectDir],
+          allowWrite: [projectDir],
+          denyWrite: [],
+        },
+      })
+
+      const result = await SandboxManager.wrapWithSandbox(command)
+
+      // The /dev/null mask must come after the tmpfs + ro-bind in arg order.
+      const tmpfsAt = result.indexOf(`--tmpfs ${parentDir}`)
+      const maskAt = result.indexOf(`--ro-bind /dev/null ${envFile}`)
+      expect(tmpfsAt).toBeGreaterThan(-1)
+      expect(maskAt).toBeGreaterThan(tmpfsAt)
+    } finally {
+      await SandboxManager.reset()
+      rmSync(parentDir, { recursive: true, force: true })
+    }
+  })
 })

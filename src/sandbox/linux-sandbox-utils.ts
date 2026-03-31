@@ -868,6 +868,9 @@ async function generateFilesystemArgs(
   const readAllowPaths = (readConfig?.allowWithinDeny || []).map(p =>
     normalizePathForSandbox(p),
   )
+  // Files masked by --ro-bind /dev/null below. Used to filter denyWriteArgs so
+  // that --ro-bind <host> <host> doesn't undo the mask.
+  const maskedFiles = new Set<string>()
 
   // --tmpfs / would wipe all prior mounts (ro-bind /, write binds, deny binds).
   // Expand a root deny into its direct children so the existing per-dir tmpfs
@@ -892,8 +895,14 @@ async function generateFilesystemArgs(
     readDenyPaths.push('/etc/ssh/ssh_config.d')
   }
 
-  for (const pathPattern of readDenyPaths) {
-    const normalizedPath = normalizePathForSandbox(pathPattern)
+  // Normalize then sort shallow-first so tmpfs over ancestor dirs lands before
+  // /dev/null masks on descendant files. Otherwise a file-deny listed before
+  // a dir-deny in denyRead gets wiped when the ancestor tmpfs is applied.
+  const normalizedDenyPaths = readDenyPaths
+    .map(p => normalizePathForSandbox(p))
+    .sort((a, b) => a.split('/').length - b.split('/').length)
+
+  for (const normalizedPath of normalizedDenyPaths) {
     if (!fs.existsSync(normalizedPath)) {
       logForDebugging(
         `[Sandbox Linux] Skipping non-existent read deny path: ${normalizedPath}`,
@@ -948,13 +957,11 @@ async function generateFilesystemArgs(
         }
       }
     } else {
-      // For files, check if this specific file is re-allowed
-      const isReAllowed = readAllowPaths.some(
-        allowPath =>
-          normalizedPath === allowPath ||
-          normalizedPath.startsWith(allowPath + '/'),
-      )
-      if (isReAllowed) {
+      // For files, only an exact allowRead match overrides the deny. A
+      // directory allowRead does not un-deny a file specifically listed in
+      // denyRead — otherwise denyRead: ['.env'] + allowRead: ['.'] silently
+      // drops the .env deny.
+      if (readAllowPaths.includes(normalizedPath)) {
         logForDebugging(
           `[Sandbox Linux] Skipping read deny for re-allowed path: ${normalizedPath}`,
         )
@@ -962,13 +969,20 @@ async function generateFilesystemArgs(
       }
       // For files, bind /dev/null instead of tmpfs
       args.push('--ro-bind', '/dev/null', normalizedPath)
+      maskedFiles.add(normalizedPath)
     }
   }
 
   // Emitting denyWrite last means these ro-binds layer on top of any write
   // paths the denyRead loop just re-bound. Before this ordering, tmpfs over
-  // an ancestor of cwd would wipe the .git/hooks protection.
-  args.push(...denyWriteArgs)
+  // an ancestor of cwd would wipe the .git/hooks protection. But skip any
+  // dest already masked by denyRead — --ro-bind <host> <host> for denyWrite
+  // would undo --ro-bind /dev/null <host> from denyRead, which landed first.
+  for (let i = 0; i < denyWriteArgs.length; i += 3) {
+    const dest = denyWriteArgs[i + 2]!
+    if (maskedFiles.has(dest)) continue
+    args.push(denyWriteArgs[i]!, denyWriteArgs[i + 1]!, dest)
+  }
 
   return args
 }
