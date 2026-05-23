@@ -47,8 +47,9 @@
 //!      — but keeping an `ALE_USER_ID` condition on every filter
 //!      makes enumeration uniform.
 //!
-//! Filters carry a small JSON tag in `providerData` (`{tool, kind}`)
-//! so install/uninstall/status can locate them by enumeration. There
+//! Filters carry a small JSON tag in `providerData` (`{tool, kind,
+//! port_range?}`) so install/uninstall/status can locate them by
+//! enumeration. There
 //! is no marker file: `wfp status` enumerates the live engine; `group
 //! status` queries SAM and the current token directly.
 
@@ -868,6 +869,11 @@ pub fn parse_port_range(s: &str) -> Result<(u16, u16)> {
         .trim()
         .parse()
         .map_err(|_| anyhow!("invalid high port '{hi_s}'"))?;
+    if lo == 0 {
+        // Port 0 is "any" at bind time and never appears as a
+        // remote port, so it's a dead slot in the range.
+        return Err(anyhow!("low port must be >= 1"));
+    }
     if lo > hi {
         return Err(anyhow!("low ({lo}) > high ({hi})"));
     }
@@ -954,8 +960,8 @@ mod tests {
         assert_eq!(parse_port_range("60080-60089").unwrap(), (60080, 60089));
         assert_eq!(parse_port_range(" 1 - 1 ").unwrap(), (1, 1));
         assert_eq!(
-            parse_port_range("0-64").unwrap(),
-            (0, MAX_PROXY_PORT_RANGE_WIDTH)
+            parse_port_range("1-65").unwrap(),
+            (1, 1 + MAX_PROXY_PORT_RANGE_WIDTH)
         );
     }
 
@@ -966,6 +972,7 @@ mod tests {
         assert!(parse_port_range("60080").is_err()); // no dash
         assert!(parse_port_range("a-b").is_err()); // not u16
         assert!(parse_port_range("0-65536").is_err()); // overflow
+        assert!(parse_port_range("0-9").is_err()); // port 0
     }
 
     #[test]

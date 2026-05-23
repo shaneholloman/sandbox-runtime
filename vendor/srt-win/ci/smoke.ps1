@@ -134,8 +134,12 @@ $wsR = J (@('wfp', 'status') + $sl)
 if ($wsR.port_range[0] -ne 50000 -or $wsR.port_range[1] -ne 50001) {
   throw "expected port_range [50000,50001], got [$($wsR.port_range -join ',')]"
 }
-# Restore the default range for the rest of the lifecycle assertions.
-Run (@('wfp', 'install', '--name', $GroupName) + $sl + $pr)
+# No-flag install: assert the compiled-in DEFAULT_PROXY_PORT_RANGE.
+Run (@('wfp', 'install', '--name', $GroupName) + $sl)
+$wsD = J (@('wfp', 'status') + $sl)
+if ($wsD.port_range[0] -ne 60080 -or $wsD.port_range[1] -ne 60089) {
+  throw "no-flag default expected [60080,60089], got [$($wsD.port_range -join ',')]"
+}
 
 # ── --sublayer-guid isolation ────────────────────────────────────────
 # Persist the alt GUID so an always()-gated cleanup step can remove
