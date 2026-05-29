@@ -6,9 +6,14 @@ import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import { getPlatform, getWslVersion } from '../utils/platform.js'
 import * as fs from 'fs'
-import type { SandboxRuntimeConfig, SeccompConfig } from './sandbox-config.js'
+import type {
+  CredentialsConfig,
+  SandboxRuntimeConfig,
+  SeccompConfig,
+} from './sandbox-config.js'
 import type {
   SandboxAskCallback,
+  CredentialRestrictionConfig,
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
   NetworkRestrictionConfig,
@@ -30,6 +35,8 @@ import {
   containsGlobChars,
   removeTrailingGlobSuffix,
   expandGlobPattern,
+  normalizePathForSandbox,
+  DANGEROUS_CREDENTIAL_PATHS,
 } from './sandbox-utils.js'
 import { SandboxViolationStore } from './sandbox-violation-store.js'
 import {
@@ -423,13 +430,61 @@ function checkDependencies(ripgrepConfig?: {
   return { errors, warnings }
 }
 
+/**
+ * Build the read-deny / env-unset sets implied by the `credentials` config.
+ *
+ * The DANGEROUS_CREDENTIAL_PATHS defaults are included only when a
+ * `credentials` section is present, so configs without one keep today's
+ * default-allow read behavior. An explicit `mode: 'allow'` file entry exempts
+ * the matching default (compared after path normalization); it never weakens
+ * caller-supplied filesystem.denyRead or `mode: 'deny'` entries.
+ */
+function getCredentialRestrictions(
+  credentials: CredentialsConfig | undefined,
+): CredentialRestrictionConfig {
+  if (!credentials) {
+    return { denyReadPaths: [], unsetEnvVars: [] }
+  }
+
+  const files = credentials.files ?? []
+  const allowedPaths = new Set(
+    files
+      .filter(f => f.mode === 'allow')
+      .map(f => normalizePathForSandbox(f.path)),
+  )
+  const denyReadPaths = [
+    ...files.filter(f => f.mode === 'deny').map(f => f.path),
+    ...DANGEROUS_CREDENTIAL_PATHS.filter(
+      p => !allowedPaths.has(normalizePathForSandbox(p)),
+    ),
+  ]
+
+  const unsetEnvVars = (credentials.envVars ?? [])
+    .filter(v => v.mode === 'deny')
+    .map(v => v.name)
+
+  return {
+    denyReadPaths: [...new Set(denyReadPaths)],
+    unsetEnvVars: [...new Set(unsetEnvVars)],
+  }
+}
+
 function getFsReadConfig(): FsReadRestrictionConfig {
   if (!config) {
     return { denyOnly: [], allowWithinDeny: [] }
   }
 
+  // Credential deny paths are unioned with the caller's denyRead — never
+  // replacing it — so explicit filesystem restrictions always survive.
+  const rawDenyRead = [
+    ...new Set([
+      ...config.filesystem.denyRead,
+      ...getCredentialRestrictions(config.credentials).denyReadPaths,
+    ]),
+  ]
+
   const denyPaths: string[] = []
-  for (const p of config.filesystem.denyRead) {
+  for (const p of rawDenyRead) {
     const stripped = removeTrailingGlobSuffix(p)
     if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
       // Expand glob to concrete paths on Linux (bubblewrap doesn't support globs)
@@ -629,8 +684,20 @@ async function wrapWithSandbox(
       customConfig?.filesystem?.denyWrite ?? config?.filesystem.denyWrite ?? [],
     ),
   }
-  const rawDenyRead =
-    customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? []
+  // Credential file denies and env unsets derived from the credentials
+  // section. The deny paths are unioned with the caller's denyRead — never
+  // replacing it — so explicit filesystem restrictions always survive.
+  const credentialRestrictions = getCredentialRestrictions(
+    customConfig?.credentials ?? config?.credentials,
+  )
+  const rawDenyRead = [
+    ...new Set([
+      ...(customConfig?.filesystem?.denyRead ??
+        config?.filesystem.denyRead ??
+        []),
+      ...credentialRestrictions.denyReadPaths,
+    ]),
+  ]
   const expandedDenyRead: string[] = []
   for (const p of rawDenyRead) {
     const stripped = removeTrailingGlobSuffix(p)
@@ -701,6 +768,7 @@ async function wrapWithSandbox(
         caCertPath: mitmCA?.certPath,
         readConfig,
         writeConfig,
+        unsetEnvVars: credentialRestrictions.unsetEnvVars,
         allowUnixSockets: getAllowUnixSockets(),
         allowAllUnixSockets: getAllowAllUnixSockets(),
         allowLocalBinding: getAllowLocalBinding(),
@@ -732,6 +800,7 @@ async function wrapWithSandbox(
         caCertPath: mitmCA?.certPath,
         readConfig,
         writeConfig,
+        unsetEnvVars: credentialRestrictions.unsetEnvVars,
         enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
         allowAllUnixSockets: getAllowAllUnixSockets(),
         binShell,
