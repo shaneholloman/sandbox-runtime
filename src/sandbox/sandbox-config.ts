@@ -364,6 +364,17 @@ export const SandboxRuntimeConfigSchema = z.object({
         'when using httpProxyPort with a MITM proxy and custom CA. Enabling this opens a potential data ' +
         'exfiltration vector through the trustd service. Only enable if you need Go TLS verification.',
     ),
+  allowAppleEvents: z
+    .boolean()
+    .optional()
+    .describe(
+      'Allow sending Apple Events and Launch Services open requests from the sandbox (macOS only). ' +
+        'Needed for open, osascript, and anything that opens URLs or scripts other apps via AppleScript. ' +
+        'This removes code-execution isolation: sandboxed commands can launch other applications ' +
+        'unsandboxed with no user prompt (launched apps are not subject to the sandbox filesystem or ' +
+        'network restrictions), and can script running apps subject to TCC automation consent. ' +
+        'Default: false.',
+    ),
   ripgrep: RipgrepConfigSchema.optional().describe(
     'Custom ripgrep configuration (default: { command: "rg" })',
   ),
