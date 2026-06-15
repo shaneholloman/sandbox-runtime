@@ -364,6 +364,12 @@ export function generateProxyEnvVars(
     // Lowercase versions for compatibility with some tools
     envVars.push(`http_proxy=http://${auth}localhost:${httpProxyPort}`)
     envVars.push(`https_proxy=http://${auth}localhost:${httpProxyPort}`)
+    if (proxyAuthToken) {
+      // Pre-send Basic so git never gets a 407 and never invokes a
+      // credential helper for the proxy URL (Windows GCM intercepts the
+      // challenge and the URL-embedded password doesn't survive it).
+      envVars.push(`GIT_CONFIG_PARAMETERS='http.proxyAuthMethod=basic'`)
+    }
   }
 
   if (socksProxyPort) {

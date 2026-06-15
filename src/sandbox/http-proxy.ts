@@ -81,11 +81,14 @@ export interface HttpProxyServerOptions {
 export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
   const server = createServer()
 
-  const expectedAuth = options.proxyAuthToken
-    ? 'Basic ' + Buffer.from(`srt:${options.proxyAuthToken}`).toString('base64')
-    : undefined
-  const checkAuth = (got: string | undefined): boolean =>
-    !expectedAuth || got === expectedAuth
+  const checkAuth = (got: string | undefined): boolean => {
+    if (!options.proxyAuthToken) return true
+    const m = /^basic\s+([a-z0-9+/=]+)\s*$/i.exec(got ?? '')
+    if (!m) return false
+    const decoded = Buffer.from(m[1]!, 'base64').toString('utf8')
+    const sep = decoded.indexOf(':')
+    return sep > 0 && decoded.slice(sep + 1) === options.proxyAuthToken
+  }
 
   // Handle CONNECT requests for HTTPS traffic
   server.on('connect', async (req, socket, head) => {
