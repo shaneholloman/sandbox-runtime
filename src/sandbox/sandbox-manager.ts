@@ -6,6 +6,7 @@ import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import { getPlatform, getWslVersion } from '../utils/platform.js'
 import * as fs from 'fs'
+import { randomBytes } from 'node:crypto'
 import type {
   CredentialsConfig,
   SandboxRuntimeConfig,
@@ -30,6 +31,13 @@ import {
   wrapCommandWithSandboxMacOS,
   startMacOSSandboxLogMonitor,
 } from './macos-sandbox-utils.js'
+import {
+  checkWindowsDependencies,
+  wrapCommandWithSandboxWindows,
+  DEFAULT_WINDOWS_GROUP_NAME,
+  DEFAULT_WINDOWS_PROXY_PORT_RANGE,
+  type WindowsGroupRef,
+} from './windows-sandbox-utils.js'
 import {
   getDefaultWritePaths,
   containsGlobChars,
@@ -68,6 +76,10 @@ let cleanupRegistered = false
 let logMonitorShutdown: (() => void) | undefined
 let parentProxy: ResolvedParentProxy | undefined
 let mitmCA: MitmCA | undefined
+// Per-session proxy auth token. Generated at proxy start, exported only into
+// the sandbox child env, checked on every CONNECT/request — so a host process
+// dialing 127.0.0.1:<proxyPort> can't reach the filter callback.
+let proxyAuthToken: string | undefined
 const sandboxViolationStore = new SandboxViolationStore()
 
 // ============================================================================
@@ -92,6 +104,9 @@ function registerCleanup(): void {
 
 function matchesDomainPattern(hostname: string, pattern: string): boolean {
   const h = hostname.toLowerCase()
+  // Bare '*' is deny-all when it appears in deniedDomains. The schema only
+  // accepts it there (allowedDomains still rejects it as too broad).
+  if (pattern === '*') return true
   // Support wildcard patterns like *.example.com. Never apply wildcard
   // suffix matching to IP literals — an IPv6 zone-ID payload like
   // `::ffff:1.2.3.4%x.allowed.com` would otherwise pass .endsWith() while
@@ -151,8 +166,9 @@ async function filterNetworkRequest(
     }
   }
 
-  // No matching rules - ask user or deny
-  if (!sandboxAskCallback) {
+  // No matching rules - ask user or deny. strictAllowlist makes the
+  // allowlist deterministic enforcement: never fall through to the callback.
+  if (!sandboxAskCallback || config.network.strictAllowlist) {
     logForDebugging(`No matching config rule, denying: ${host}:${port}`)
     return false
   }
@@ -197,8 +213,70 @@ function getMitmSocketPath(host: string): string | undefined {
   return undefined
 }
 
+/**
+ * Bind `server.listen()` to the first free port in `[lo, hi]`,
+ * skipping `EADDRINUSE`. With `range` undefined, binds to ephemeral
+ * port 0 (the previous behaviour).
+ *
+ * Used on Windows: the WFP loopback permit only covers a fixed port
+ * range (default 60080–60089), so the JS proxies must bind inside it
+ * for the sandboxed child to reach them. On other platforms the
+ * sandbox layer (seatbelt rule, namespace+socat) targets whatever
+ * port we landed on, so ephemeral is fine.
+ */
+function listenInRange(
+  server: {
+    once(ev: 'error' | 'listening', cb: (e?: Error) => void): unknown
+    removeListener(ev: 'error' | 'listening', cb: (e?: Error) => void): unknown
+  },
+  doListen: (port: number) => void,
+  range: readonly [number, number] | undefined,
+  exclude: ReadonlySet<number>,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const [lo, hi] = range ?? [0, 0]
+    let port = lo
+    const tryNext = (): void => {
+      while (exclude.has(port) && port <= hi) port++
+      if (port > hi) {
+        reject(
+          new Error(
+            `No free port in range ${lo}-${hi} (excluding ${[...exclude].join(',')})`,
+          ),
+        )
+        return
+      }
+      const onListening = (): void => {
+        server.removeListener('error', onError)
+        resolve()
+      }
+      const onError = (err?: Error): void => {
+        // The paired 'listening' once-listener never fired; drop it
+        // so retries don't accumulate stale listeners.
+        server.removeListener('listening', onListening)
+        if (
+          range &&
+          (err as NodeJS.ErrnoException)?.code === 'EADDRINUSE' &&
+          port < hi
+        ) {
+          port++
+          tryNext()
+          return
+        }
+        reject(err ?? new Error('listen error'))
+      }
+      server.once('error', onError)
+      server.once('listening', onListening)
+      doListen(range ? port : 0)
+    }
+    tryNext()
+  })
+}
+
 async function startHttpProxyServer(
-  sandboxAskCallback?: SandboxAskCallback,
+  sandboxAskCallback: SandboxAskCallback | undefined,
+  portRange: readonly [number, number] | undefined,
+  excludePorts: ReadonlySet<number>,
 ): Promise<number> {
   httpProxyServer = createHttpProxyServer({
     filter: (port: number, host: string) =>
@@ -207,56 +285,63 @@ async function startHttpProxyServer(
     mitmCA,
     filterRequest: config?.network.filterRequest,
     parentProxy,
+    proxyAuthToken,
   })
 
-  return new Promise<number>((resolve, reject) => {
-    if (!httpProxyServer) {
-      reject(new Error('HTTP proxy server undefined before listen'))
-      return
-    }
-
-    const server = httpProxyServer
-
-    server.once('error', reject)
-    server.once('listening', () => {
-      const address = server.address()
-      if (address && typeof address === 'object') {
-        server.unref()
-        logForDebugging(`HTTP proxy listening on localhost:${address.port}`)
-        resolve(address.port)
-      } else {
-        reject(new Error('Failed to get proxy server address'))
-      }
-    })
-
-    server.listen(0, '127.0.0.1')
-  })
+  const server = httpProxyServer
+  await listenInRange(
+    server,
+    p => server.listen(p, '127.0.0.1'),
+    portRange,
+    excludePorts,
+  )
+  const address = server.address()
+  if (!address || typeof address !== 'object') {
+    throw new Error('Failed to get HTTP proxy server address')
+  }
+  server.unref()
+  logForDebugging(`HTTP proxy listening on localhost:${address.port}`)
+  return address.port
 }
 
 async function startSocksProxyServer(
-  sandboxAskCallback?: SandboxAskCallback,
+  sandboxAskCallback: SandboxAskCallback | undefined,
+  portRange: readonly [number, number] | undefined,
+  excludePorts: ReadonlySet<number>,
 ): Promise<number> {
   socksProxyServer = createSocksProxyServer({
     filter: (port: number, host: string) =>
       filterNetworkRequest(port, host, sandboxAskCallback),
     parentProxy,
+    proxyAuthToken,
   })
 
-  return new Promise<number>((resolve, reject) => {
-    if (!socksProxyServer) {
-      // This is mostly just for the typechecker
-      reject(new Error('SOCKS proxy server undefined before listen'))
-      return
+  const wrapper = socksProxyServer
+  // SocksProxyWrapper.listen() resolves with the bound port; we
+  // adapt it to the listenInRange shape by retrying on EADDRINUSE
+  // here directly rather than via the once('error') path.
+  if (!portRange) {
+    const port = await wrapper.listen(0, '127.0.0.1')
+    wrapper.unref()
+    return port
+  }
+  let lastErr: unknown
+  for (let p = portRange[0]; p <= portRange[1]; p++) {
+    if (excludePorts.has(p)) continue
+    try {
+      const port = await wrapper.listen(p, '127.0.0.1')
+      wrapper.unref()
+      return port
+    } catch (err) {
+      lastErr = err
+      if ((err as NodeJS.ErrnoException)?.code !== 'EADDRINUSE') throw err
     }
-
-    socksProxyServer
-      .listen(0, '127.0.0.1')
-      .then((port: number) => {
-        socksProxyServer?.unref()
-        resolve(port)
-      })
-      .catch(reject)
-  })
+  }
+  throw new Error(
+    `No free SOCKS port in range ${portRange[0]}-${portRange[1]}: ${
+      (lastErr as Error)?.message ?? 'all in use'
+    }`,
+  )
 }
 
 // ============================================================================
@@ -321,7 +406,22 @@ async function initialize(
   // Initialize network infrastructure
   initializationPromise = (async () => {
     try {
-      // Conditionally start proxy servers based on config
+      // On Windows the WFP loopback permit covers a fixed port
+      // range, so the proxies must bind inside it. Other platforms
+      // bake the actual ephemeral port into the sandbox profile, so
+      // they keep using port 0.
+      const portRange: readonly [number, number] | undefined =
+        getPlatform() === 'windows'
+          ? (config.windows?.proxyPortRange ?? DEFAULT_WINDOWS_PROXY_PORT_RANGE)
+          : undefined
+
+      // The auth token is only set when this process owns the proxy; an
+      // external proxy (config.network.httpProxyPort) handles its own auth,
+      // and embedding our token in its URL would be wrong.
+      proxyAuthToken =
+        config.network.httpProxyPort !== undefined
+          ? undefined
+          : randomBytes(16).toString('hex')
       let httpProxyPort: number
       if (config.network.httpProxyPort !== undefined) {
         // Use external HTTP proxy (don't start a server)
@@ -329,7 +429,11 @@ async function initialize(
         logForDebugging(`Using external HTTP proxy on port ${httpProxyPort}`)
       } else {
         // Start local HTTP proxy
-        httpProxyPort = await startHttpProxyServer(sandboxAskCallback)
+        httpProxyPort = await startHttpProxyServer(
+          sandboxAskCallback,
+          portRange,
+          new Set(),
+        )
       }
 
       let socksProxyPort: number
@@ -338,8 +442,13 @@ async function initialize(
         socksProxyPort = config.network.socksProxyPort
         logForDebugging(`Using external SOCKS proxy on port ${socksProxyPort}`)
       } else {
-        // Start local SOCKS proxy
-        socksProxyPort = await startSocksProxyServer(sandboxAskCallback)
+        // Start local SOCKS proxy. Skip the port the HTTP proxy
+        // already took.
+        socksProxyPort = await startSocksProxyServer(
+          sandboxAskCallback,
+          portRange,
+          new Set([httpProxyPort]),
+        )
       }
 
       // Initialize platform-specific infrastructure
@@ -382,7 +491,18 @@ function isSupportedPlatform(): boolean {
     // WSL1 doesn't support bubblewrap
     return getWslVersion() !== '1'
   }
-  return platform === 'macos'
+  return platform === 'macos' || platform === 'windows'
+}
+
+/**
+ * Resolve the Windows group reference from config. Used by both the
+ * dependency check and `wrapWithSandbox` so they agree.
+ */
+function getWindowsGroupRef(): WindowsGroupRef {
+  return {
+    groupName: config?.windows?.groupName ?? DEFAULT_WINDOWS_GROUP_NAME,
+    groupSid: config?.windows?.groupSid,
+  }
 }
 
 function isSandboxingEnabled(): boolean {
@@ -423,6 +543,13 @@ function checkDependencies(ripgrepConfig?: {
     })
     errors.push(...linuxDeps.errors)
     warnings.push(...linuxDeps.warnings)
+  } else if (platform === 'windows') {
+    const winDeps = checkWindowsDependencies(
+      getWindowsGroupRef(),
+      config?.windows?.wfpSublayerGuid,
+    )
+    errors.push(...winDeps.errors)
+    warnings.push(...winDeps.warnings)
   }
 
   return { errors, warnings }
@@ -547,11 +674,17 @@ function getNetworkRestrictionConfig(): NetworkRestrictionConfig {
     return {}
   }
 
+  // Preserve an explicitly-empty allowlist: consumers need to distinguish
+  // "no network restriction configured" (absent) from "allowlist configured
+  // with zero entries" (block-all / ask-only). Stripping the empty array
+  // made a host app's restriction-status UI report an airgapped config as
+  // unrestricted. deniedHosts keeps the strip — an empty denylist and an
+  // absent one are semantically identical.
   const allowedHosts = config.network.allowedDomains
   const deniedHosts = config.network.deniedDomains
 
   return {
-    ...(allowedHosts.length > 0 && { allowedHosts }),
+    allowedHosts,
     ...(deniedHosts.length > 0 && { deniedHosts }),
   }
 }
@@ -584,6 +717,10 @@ function getEnableWeakerNetworkIsolation(): boolean | undefined {
   return config?.enableWeakerNetworkIsolation
 }
 
+function getAllowAppleEvents(): boolean | undefined {
+  return config?.allowAppleEvents
+}
+
 function getRipgrepConfig(): { command: string; args?: string[] } {
   return config?.ripgrep ?? { command: 'rg' }
 }
@@ -598,6 +735,10 @@ function getAllowGitConfig(): boolean {
 
 function getSeccompConfig(): SeccompConfig | undefined {
   return config?.seccomp
+}
+
+function getProxyAuthToken(): string | undefined {
+  return proxyAuthToken
 }
 
 function getProxyPort(): number | undefined {
@@ -752,6 +893,7 @@ async function wrapWithSandbox(
         // Only pass proxy ports if proxy is running (when there are domains to filter)
         httpProxyPort: needsNetworkProxy ? getProxyPort() : undefined,
         socksProxyPort: needsNetworkProxy ? getSocksProxyPort() : undefined,
+        proxyAuthToken: needsNetworkProxy ? proxyAuthToken : undefined,
         caCertPath: mitmCA?.certPath,
         readConfig,
         writeConfig,
@@ -764,6 +906,7 @@ async function wrapWithSandbox(
         allowPty,
         allowGitConfig: getAllowGitConfig(),
         enableWeakerNetworkIsolation: getEnableWeakerNetworkIsolation(),
+        allowAppleEvents: getAllowAppleEvents(),
         binShell,
       })
 
@@ -784,6 +927,7 @@ async function wrapWithSandbox(
         socksProxyPort: needsNetworkProxy
           ? managerContext?.socksProxyPort
           : undefined,
+        proxyAuthToken: needsNetworkProxy ? proxyAuthToken : undefined,
         caCertPath: mitmCA?.certPath,
         readConfig,
         writeConfig,
@@ -800,12 +944,73 @@ async function wrapWithSandbox(
         abortSignal,
       })
 
+    case 'windows':
+      // Windows wraps to an argv array, not a shell string. Forcing
+      // callers through wrapWithSandboxArgv() means they spawn with
+      // {shell:false}, which is the security boundary that keeps the
+      // user's command bytes off the HOST shell.
+      throw new Error(
+        'wrapWithSandbox() returns a shell string and is not supported ' +
+          'on Windows. Use SandboxManager.wrapWithSandboxArgv() and ' +
+          'spawn the result with {shell: false}.',
+      )
+
     default:
       // Unsupported platform - this should not happen since isSandboxingEnabled() checks platform support
       throw new Error(
         `Sandbox configuration is not supported on platform: ${platform}`,
       )
   }
+}
+
+/**
+ * Wrap `command` for the sandbox and return a spawn descriptor:
+ * `{ argv, env }`, suitable for
+ * `spawn(argv[0], argv.slice(1), {shell: false, env})`.
+ *
+ * On Windows this is the ONLY supported wrap method (see
+ * {@link wrapWithSandbox}); `env` carries the full proxy set that the
+ * sandboxed child inherits (`srt-win exec` forwards its environment
+ * verbatim — see {@link wrapCommandWithSandboxWindows}). On
+ * macOS/Linux `argv` is `[binShell, '-c', <wrapWithSandbox result>]`
+ * (proxy env is baked into that command) and `env` is the unchanged
+ * `process.env`, so callers can spawn uniformly across platforms.
+ */
+async function wrapWithSandboxArgv(
+  command: string,
+  binShell?: string,
+  customConfig?: Partial<SandboxRuntimeConfig>,
+  abortSignal?: AbortSignal,
+): Promise<{ argv: string[]; env: NodeJS.ProcessEnv }> {
+  const platform = getPlatform()
+
+  if (platform === 'windows') {
+    const hasNetworkConfig =
+      customConfig?.network?.allowedDomains !== undefined ||
+      config?.network?.allowedDomains !== undefined
+    if (hasNetworkConfig) {
+      await waitForNetworkInitialization()
+    }
+    return wrapCommandWithSandboxWindows({
+      command,
+      group: getWindowsGroupRef(),
+      httpProxyPort: hasNetworkConfig ? getProxyPort() : undefined,
+      socksProxyPort: hasNetworkConfig ? getSocksProxyPort() : undefined,
+      proxyAuthToken: hasNetworkConfig ? proxyAuthToken : undefined,
+      binShell,
+    })
+  }
+
+  // macOS/Linux: delegate to the existing string wrapper, then put
+  // the result behind `<shell> -c` so the caller's argv-spawn works.
+  const wrapped = await wrapWithSandbox(
+    command,
+    binShell,
+    customConfig,
+    abortSignal,
+  )
+  const shell = binShell ?? '/bin/bash'
+  return { argv: [shell, '-c', wrapped], env: process.env }
 }
 
 /**
@@ -817,7 +1022,21 @@ function getConfig(): SandboxRuntimeConfig | undefined {
 }
 
 /**
- * Update the sandbox configuration
+ * Update the sandbox configuration in place.
+ *
+ * **Network/allowlist changes are a live swap**: the running
+ * http/socks proxies read `config.network.allowedDomains` /
+ * `deniedDomains` per-request (via `filterNetworkRequest`), so
+ * reassigning `config` here takes effect on the next connection
+ * with no proxy rebind and no port change — on every platform,
+ * including Windows. This is what lets a host enable/deny domains
+ * for already-running sandboxed children.
+ *
+ * Filesystem changes (denyRead/denyWrite) are NOT applied live:
+ * macOS bakes them into the seatbelt profile at wrap time, and
+ * Windows will need an explicit re-stamp. To change FS
+ * restrictions, reset() then initialize() with the new config.
+ *
  * @param newConfig - The new configuration to use
  */
 function updateConfig(newConfig: SandboxRuntimeConfig): void {
@@ -1035,6 +1254,7 @@ async function reset(): Promise<void> {
 
   // Clear references
   httpProxyServer = undefined
+  proxyAuthToken = undefined
   socksProxyServer = undefined
   managerContext = undefined
   initializationPromise = undefined
@@ -1133,6 +1353,7 @@ export interface ISandboxManager {
   getIgnoreViolations(): Record<string, string[]> | undefined
   getEnableWeakerNestedSandbox(): boolean | undefined
   getProxyPort(): number | undefined
+  getProxyAuthToken(): string | undefined
   getSocksProxyPort(): number | undefined
   getLinuxHttpSocketPath(): string | undefined
   getLinuxSocksSocketPath(): string | undefined
@@ -1143,6 +1364,12 @@ export interface ISandboxManager {
     customConfig?: Partial<SandboxRuntimeConfig>,
     abortSignal?: AbortSignal,
   ): Promise<string>
+  wrapWithSandboxArgv(
+    command: string,
+    binShell?: string,
+    customConfig?: Partial<SandboxRuntimeConfig>,
+    abortSignal?: AbortSignal,
+  ): Promise<{ argv: string[]; env: NodeJS.ProcessEnv }>
   getSandboxViolationStore(): SandboxViolationStore
   annotateStderrWithSandboxFailures(command: string, stderr: string): string
   getLinuxGlobPatternWarnings(): string[]
@@ -1175,11 +1402,13 @@ export const SandboxManager: ISandboxManager = {
   getIgnoreViolations,
   getEnableWeakerNestedSandbox,
   getProxyPort,
+  getProxyAuthToken,
   getSocksProxyPort,
   getLinuxHttpSocketPath,
   getLinuxSocksSocketPath,
   waitForNetworkInitialization,
   wrapWithSandbox,
+  wrapWithSandboxArgv,
   cleanupAfterCommand,
   reset,
   getMitmCA: () => mitmCA,

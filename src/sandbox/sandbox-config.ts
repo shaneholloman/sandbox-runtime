@@ -194,8 +194,16 @@ export const NetworkConfigSchema = z.object({
     .array(domainPatternSchema)
     .describe('List of allowed domains (e.g., ["github.com", "*.npmjs.org"])'),
   deniedDomains: z
-    .array(domainPatternSchema)
-    .describe('List of denied domains'),
+    .array(z.union([z.literal('*'), domainPatternSchema]))
+    .describe(
+      'List of denied domains. Unlike allowedDomains, a bare "*" is accepted here (deny-all).',
+    ),
+  strictAllowlist: z
+    .boolean()
+    .optional()
+    .describe(
+      'If true, hosts not in allowedDomains are denied without consulting the ask callback. Set this when allowedDomains is policy enforcement, not a prompt-suppression hint.',
+    ),
   allowUnixSockets: z
     .array(z.string())
     .optional()
@@ -353,6 +361,51 @@ export const RipgrepConfigSchema = z.object({
 })
 
 /**
+ * Windows-specific configuration schema. See
+ * `windows-sandbox-utils.ts` for the install flow these settings
+ * must agree with.
+ */
+export const WindowsConfigSchema = z.object({
+  groupName: z
+    .string()
+    .min(1)
+    .default('sandbox-runtime-net')
+    .describe(
+      'Discriminator group name. Must match the group created at install ' +
+        'time. Ignored if groupSid is set.',
+    ),
+  groupSid: z
+    .string()
+    .regex(/^S-1-/, 'must be an S-1-… SID string')
+    .optional()
+    .describe(
+      'Discriminator group SID. Overrides groupName lookup — use for ' +
+        'domain groups or where name resolution is unreliable.',
+    ),
+  wfpSublayerGuid: z
+    .string()
+    .uuid()
+    .optional()
+    .describe(
+      'WFP sublayer GUID under which the filters were installed. Omit to ' +
+        'use the srt-win compile-time default. Set this when filters were ' +
+        'installed by enterprise tooling under a custom sublayer.',
+    ),
+  proxyPortRange: z
+    .tuple([z.number().int().min(1), z.number().int().max(65535)])
+    .refine(([lo, hi]) => lo <= hi && hi - lo <= 64, {
+      message: 'low must be ≤ high and range width ≤ 64',
+    })
+    .optional()
+    .describe(
+      'Inclusive [low, high] port range the JS http/socks proxies bind ' +
+        'inside. MUST match the range passed to `srt-win wfp install ' +
+        '--proxy-port-range` (default 60080–60089) — the WFP loopback ' +
+        'permit only covers ports in that range.',
+    ),
+})
+
+/**
  * Seccomp configuration schema (Linux only)
  */
 export const SeccompConfigSchema = z.object({
@@ -398,6 +451,17 @@ export const SandboxRuntimeConfigSchema = z.object({
         'when using httpProxyPort with a MITM proxy and custom CA. Enabling this opens a potential data ' +
         'exfiltration vector through the trustd service. Only enable if you need Go TLS verification.',
     ),
+  allowAppleEvents: z
+    .boolean()
+    .optional()
+    .describe(
+      'Allow sending Apple Events and Launch Services open requests from the sandbox (macOS only). ' +
+        'Needed for open, osascript, and anything that opens URLs or scripts other apps via AppleScript. ' +
+        'This removes code-execution isolation: sandboxed commands can launch other applications ' +
+        'unsandboxed with no user prompt (launched apps are not subject to the sandbox filesystem or ' +
+        'network restrictions), and can script running apps subject to TCC automation consent. ' +
+        'Default: false.',
+    ),
   ripgrep: RipgrepConfigSchema.optional().describe(
     'Custom ripgrep configuration (default: { command: "rg" })',
   ),
@@ -430,6 +494,9 @@ export const SandboxRuntimeConfigSchema = z.object({
       'Linux only: absolute path to the socat binary. ' +
         'When set, this path is used directly instead of resolving "socat" via PATH.',
     ),
+  windows: WindowsConfigSchema.optional().describe(
+    'Windows-specific settings (group, WFP sublayer, proxy port range).',
+  ),
 })
 
 // Export inferred types
@@ -448,4 +515,5 @@ export type IgnoreViolationsConfig = z.infer<
 >
 export type RipgrepConfig = z.infer<typeof RipgrepConfigSchema>
 export type SeccompConfig = z.infer<typeof SeccompConfigSchema>
+export type WindowsConfig = z.infer<typeof WindowsConfigSchema>
 export type SandboxRuntimeConfig = z.infer<typeof SandboxRuntimeConfigSchema>

@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { X509Certificate } from 'node:crypto'
 import { createSecureContext } from 'node:tls'
+import forge from 'node-forge'
 import { createMitmCA, disposeMitmCA } from '../../src/sandbox/mitm-ca.js'
 import { mintLeafCert, secureContextFor } from '../../src/sandbox/mitm-leaf.js'
 import { whichSync } from '../../src/utils/which.js'
@@ -60,13 +61,37 @@ describe('mitm-leaf: mintLeafCert', () => {
     expect(mintLeafCert(ca2, 'mint-cache.example')).not.toBe(a)
   })
 
-  test('leaf validity is clamped to ≤825 days', () => {
+  test('leaf validity span is ≤99 days', () => {
     const leaf = mintLeafCert(ca, 'validity.example')
     const x = new X509Certificate(firstPemBlock(leaf.certPem))
     const days =
       (Date.parse(x.validTo) - Date.parse(x.validFrom)) / (1000 * 60 * 60 * 24)
-    expect(days).toBeGreaterThan(800)
-    expect(days).toBeLessThanOrEqual(827) // 825 + 1-day notBefore backdating + slop
+    // Span must be exactly 99 days: notAfter must be clamped relative to
+    // notBefore, not now — otherwise the 1-day backdate of notBefore pushes
+    // the span to 100, eating into our margin under the public CA/B cap.
+    expect(days).toBeGreaterThan(98)
+    expect(days).toBeLessThanOrEqual(99)
+  })
+
+  test('leaf notAfter never exceeds a short-lived CA notAfter', () => {
+    // CA expires in 10 days. Leaf must clamp to the CA, not to
+    // notBefore+99d (which would mint a leaf valid long after its issuer).
+    const shortCA = makeShortLivedCA(10)
+    try {
+      const leaf = mintLeafCert(shortCA, 'short.example')
+      const x = new X509Certificate(firstPemBlock(leaf.certPem))
+      const leafEnd = Date.parse(x.validTo)
+      const caEnd = shortCA.cert.validity.notAfter.getTime()
+      expect(leafEnd).toBeLessThanOrEqual(caEnd)
+      // Sanity: the leaf actually picked up the CA cap (within a few seconds)
+      // rather than the 825-day cap.
+      expect(caEnd - leafEnd).toBeLessThan(5_000)
+    } finally {
+      rmSync(shortCA.certPath.replace(/\/[^/]+$/, ''), {
+        recursive: true,
+        force: true,
+      })
+    }
   })
 
   // Chain verification via openssl — the strongest correctness signal.
@@ -99,6 +124,43 @@ describe('mitm-leaf: mintLeafCert', () => {
     },
   )
 })
+
+/**
+ * Build an on-disk RSA CA whose notAfter is `days` from now, then load it via
+ * createMitmCA. Used to exercise the CA-end branch of clampValidity.
+ */
+function makeShortLivedCA(days: number) {
+  const { pki, md } = forge
+  const keys = pki.rsa.generateKeyPair(1024) // small key — test speed
+  const cert = pki.createCertificate()
+  cert.publicKey = keys.publicKey
+  cert.serialNumber = '01'
+  const now = new Date()
+  cert.validity.notBefore = new Date(now.getTime() - 24 * 60 * 60 * 1000)
+  cert.validity.notAfter = new Date(now.getTime() + days * 24 * 60 * 60 * 1000)
+  const subject = [{ name: 'commonName', value: 'short-lived test CA' }]
+  cert.setSubject(subject)
+  cert.setIssuer(subject)
+  cert.setExtensions([
+    { name: 'basicConstraints', cA: true, critical: true },
+    {
+      name: 'keyUsage',
+      critical: true,
+      keyCertSign: true,
+      cRLSign: true,
+      digitalSignature: true,
+    },
+    { name: 'subjectKeyIdentifier' },
+  ])
+  cert.sign(keys.privateKey, md.sha256.create())
+
+  const dir = mkdtempSync(join(tmpdir(), 'srt-short-ca-'))
+  const certPath = join(dir, 'ca.crt')
+  const keyPath = join(dir, 'ca.key')
+  writeFileSync(certPath, pki.certificateToPem(cert))
+  writeFileSync(keyPath, pki.privateKeyToPem(keys.privateKey))
+  return createMitmCA({ caCertPath: certPath, caKeyPath: keyPath })
+}
 
 function firstPemBlock(pem: string): string {
   const m = pem.match(

@@ -11,11 +11,16 @@ import { isLinux } from '../helpers/platform.js'
 function proxyRequest(
   proxyPort: number,
   targetHost: string,
+  withAuth = true,
 ): Promise<{ allowed: boolean; statusCode?: number; response?: string }> {
   return new Promise(resolve => {
+    const token = withAuth ? SandboxManager.getProxyAuthToken() : undefined
+    const auth = token
+      ? `Proxy-Authorization: Basic ${Buffer.from(`srt:${token}`).toString('base64')}\r\n`
+      : ''
     const socket = connect(proxyPort, '127.0.0.1', () => {
       socket.write(
-        `CONNECT ${targetHost}:443 HTTP/1.1\r\nHost: ${targetHost}:443\r\n\r\n`,
+        `CONNECT ${targetHost}:443 HTTP/1.1\r\nHost: ${targetHost}:443\r\n${auth}\r\n`,
       )
     })
 
@@ -45,6 +50,59 @@ function proxyRequest(
     })
   })
 }
+
+describe('proxy auth + network deny semantics', () => {
+  beforeEach(async () => {
+    await SandboxManager.reset()
+  })
+  afterEach(async () => {
+    await SandboxManager.reset()
+  })
+
+  it('407s a CONNECT without the per-session auth token', async () => {
+    await SandboxManager.initialize({
+      network: { allowedDomains: ['example.com'], deniedDomains: [] },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    })
+    const port = SandboxManager.getProxyPort()!
+    const noAuth = await proxyRequest(port, 'example.com', false)
+    expect(noAuth.statusCode).toBe(407)
+    const withAuth = await proxyRequest(port, 'example.com', true)
+    expect(withAuth.allowed).toBe(true)
+  })
+
+  it('deniedDomains "*" denies every host', async () => {
+    await SandboxManager.initialize({
+      network: { allowedDomains: ['example.com'], deniedDomains: ['*'] },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    })
+    const port = SandboxManager.getProxyPort()!
+    expect((await proxyRequest(port, 'example.com')).statusCode).toBe(403)
+    expect((await proxyRequest(port, 'other.net')).statusCode).toBe(403)
+  })
+
+  it('strictAllowlist denies off-allowlist hosts without consulting the callback', async () => {
+    let asked = false
+    await SandboxManager.initialize(
+      {
+        network: {
+          allowedDomains: ['example.com'],
+          deniedDomains: [],
+          strictAllowlist: true,
+        },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      },
+      async () => {
+        asked = true
+        return true
+      },
+    )
+    const port = SandboxManager.getProxyPort()!
+    expect((await proxyRequest(port, 'example.com')).allowed).toBe(true)
+    expect((await proxyRequest(port, 'nope.net')).statusCode).toBe(403)
+    expect(asked).toBe(false)
+  })
+})
 
 describe('SandboxManager.updateConfig', () => {
   beforeEach(async () => {
@@ -87,10 +145,12 @@ describe('SandboxManager.updateConfig', () => {
       filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
     })
 
-    // Initial state: no allowed hosts (empty array becomes undefined in getter)
-    expect(
-      SandboxManager.getNetworkRestrictionConfig().allowedHosts,
-    ).toBeUndefined()
+    // Initial state: allowlist configured with zero entries. The getter must
+    // preserve the empty array — consumers distinguish "no allowlist
+    // configured" (undefined) from "allowlist configured, nothing allowed".
+    expect(SandboxManager.getNetworkRestrictionConfig().allowedHosts).toEqual(
+      [],
+    )
 
     // Update config to allow example.com
     SandboxManager.updateConfig({
@@ -121,7 +181,7 @@ describe('SandboxManager.updateConfig', () => {
     })
 
     config = SandboxManager.getNetworkRestrictionConfig()
-    expect(config.allowedHosts).toBeUndefined()
+    expect(config.allowedHosts).toEqual([])
     expect(config.deniedHosts).toContain('example.com')
 
     // Move back to allowlist
@@ -152,10 +212,11 @@ describe('SandboxManager.updateConfig', () => {
       filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
     })
 
-    // Empty array becomes undefined in getter
-    expect(
-      SandboxManager.getNetworkRestrictionConfig().allowedHosts,
-    ).toBeUndefined()
+    // The getter preserves the explicitly-empty allowlist so consumers can
+    // tell a configured block-all apart from no restriction at all
+    expect(SandboxManager.getNetworkRestrictionConfig().allowedHosts).toEqual(
+      [],
+    )
 
     // Verify the actual config still exists
     const fullConfig = SandboxManager.getConfig()

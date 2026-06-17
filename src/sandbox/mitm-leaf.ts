@@ -34,8 +34,9 @@ export function mintLeafCert(ca: MitmCA, hostname: string): LeafCert {
   const cert = pki.createCertificate()
   cert.publicKey = keys.publicKey
   cert.serialNumber = randomSerial()
-  cert.validity.notBefore = daysFromNow(-1)
-  cert.validity.notAfter = clampValidity(ca.cert)
+  const notBefore = daysFromNow(-1)
+  cert.validity.notBefore = notBefore
+  cert.validity.notAfter = clampValidity(ca.cert, notBefore)
   cert.setSubject([{ name: 'commonName', value: hostname }])
   cert.setIssuer(ca.cert.subject.attributes)
   cert.setExtensions([
@@ -91,10 +92,22 @@ function sanFor(hostname: string): {
     : { type: 2, value: hostname }
 }
 
-/** Leaf validity capped at min(CA notAfter, now+825d) per CA/B baseline. */
-function clampValidity(caCert: forge.pki.Certificate): Date {
+/**
+ * Leaf validity capped at min(CA notAfter, notBefore+99d).
+ *
+ * 99d sits below every TLS cert validity ceiling we care about: the current
+ * (2026-03) CA/B baseline of 200d, the next step-down to 100d in 2027-03, the
+ * historical 398d public cap, and the macOS ~825d ceiling that trips
+ * errSecCertificateIsNotStandardsCompliant on user-installed roots. Leaves are
+ * re-minted per session, so we don't need the headroom.
+ *
+ * Anchored at notBefore — not now — because notBefore is backdated by 1 day,
+ * so `now+Nd` would produce an (N+1)-day span and lose a day of margin.
+ */
+function clampValidity(caCert: forge.pki.Certificate, notBefore: Date): Date {
   const caEnd = caCert.validity.notAfter
-  const max = daysFromNow(825)
+  const max = new Date(notBefore)
+  max.setDate(max.getDate() + 99)
   return caEnd < max ? new Date(caEnd) : max
 }
 
